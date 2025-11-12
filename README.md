@@ -11,3 +11,8 @@ sudo btmgmt -i hci1 bredr off || true    # some adapters reject this; harmless
 sudo btmgmt -i hci1 connectable on
 sudo btmgmt -i hci1 bondable off         # no pairing needed for this app
 ```
+# PIP Install 
+```bash
+python3 -m pip install pyqtgraph        # pyqtgraph
+python3 -m pip install PyQt5           
+```
