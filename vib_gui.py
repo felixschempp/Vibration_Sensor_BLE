@@ -329,7 +329,7 @@ class SampleRateEMA:
 
 class PlaybackIngest(threading.Thread):
     """Reads CSV logs (t,ax,ay,az), re-emits as PACKETS (monotonic chunks)."""
-    def __init__(self, filepath: Path, out_q: SimpleQueue, chunk: int = 200):
+    def __init__(self, filepath: Path, out_q: SimpleQueue, chunk: int = 20):
         super().__init__(daemon=True)
         self.path=Path(filepath); self.q=out_q
         self.stop_flag=threading.Event()
@@ -379,16 +379,27 @@ class VibGui(QtWidgets.QMainWindow):
         self.setWindowTitle("BLE Vibration — Live / Log / Playback")
         self.resize(1400, 980)
         self.q = q
-        self.period_us = (1e6/odr_hz) if odr_hz and odr_hz>0 else None
+
+        # --- dynamic GUI sampling rate (Hz), starts from nominal ODR ---
+        self.fs_gui = odr_hz if (odr_hz and odr_hz > 0) else 400.0
+        self.period_us = 1e6 / self.fs_gui
+
         self.sens = {2:0.061e-3, 4:0.122e-3, 8:0.244e-3, 16:0.488e-3}.get(int(range_g), 0.244e-3)
         self.t0_dev_us = None
-        plot_fs = odr_hz if odr_hz>0 else 800.0
+
+        # store scrollback length (seconds retained in RAM)
+        self.buffer_s = float(buffer_s)
+
+        # use fs_gui to size the ring buffer
+        plot_fs = self.fs_gui
         cap = int(max(2048, math.ceil(buffer_s * plot_fs)))
         self.ring = Ring(cap)
         self.history_s = history_s
         self.use_hpf = use_hpf
         self.remove_mean = remove_mean
-        self.sps = SampleRateEMA(init_hz=odr_hz if odr_hz>0 else 400.0)
+
+        # EMA of *measured* sampling rate
+        self.sps = SampleRateEMA(init_hz=self.fs_gui)
         self.playback: PlaybackIngest | None = None
         self.fft_secs = 2.0  # seconds of data for FFT (fixed window)
         self.logging = False
@@ -400,7 +411,9 @@ class VibGui(QtWidgets.QMainWindow):
         self.btn_live = QtWidgets.QPushButton("Back to Live")
         self.btn_open = QtWidgets.QPushButton("Open Log…")
         self.btn_play = QtWidgets.QPushButton("▶ Play"); self.btn_play.setCheckable(True); self.btn_play.setEnabled(False)
-        self.cmb_speed = QtWidgets.QComboBox(); self.cmb_speed.addItems(["0.25×","0.5×","1×","2×","4×"]); self.cmb_speed.setCurrentText("1×")
+        self.cmb_speed = QtWidgets.QComboBox()
+        self.cmb_speed.addItems(["0.25×", "0.5×", "1×", "2×", "4×", "16×", "Max"])
+        self.cmb_speed.setCurrentText("1×")
         self.btn_log = QtWidgets.QPushButton("● Start Logging"); self.btn_log.setCheckable(True)
         self.chk_hpf = QtWidgets.QCheckBox("High-pass"); self.chk_hpf.setChecked(self.use_hpf)
         self.chk_mean = QtWidgets.QCheckBox("De-mean"); self.chk_mean.setChecked(self.remove_mean)
@@ -422,6 +435,20 @@ class VibGui(QtWidgets.QMainWindow):
         self.cur_ty = self.time_plot.plot(pen=pg.mkPen((80,200,80), width=1), name='ay')
         self.cur_tz = self.time_plot.plot(pen=pg.mkPen((80,140,240), width=1), name='az')
         root.addWidget(self.time_plot, 2)
+
+        # --- Time scroll bar (for navigating history / playback) ---
+        scroll_layout = QtWidgets.QHBoxLayout()
+        scroll_layout.addWidget(QtWidgets.QLabel("Scroll:"))
+        self.scroll_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.scroll_slider.setRange(0, 1000)
+        self.scroll_slider.setValue(1000)
+        self.scroll_slider.setEnabled(False)  # enabled in playback
+        scroll_layout.addWidget(self.scroll_slider, 1)
+        root.addLayout(scroll_layout)
+
+        self.scroll_follow_tail = True  # when True we follow latest data
+
+        self.scroll_slider.valueChanged.connect(self._on_scroll_changed)
 
         grid = QtWidgets.QGridLayout(); root.addLayout(grid, 3)
         self.fft_x = pg.PlotWidget(title="FFT X (normalized)"); self.fft_x.showGrid(x=True,y=True,alpha=0.3)
@@ -456,7 +483,8 @@ class VibGui(QtWidgets.QMainWindow):
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save log as…", str(suggested), "CSV (*.csv)")
             if not path: self.btn_log.setChecked(False); return
             try:
-                self.log_fp=open(path,'w',newline=''); self.log_writer=csv.writer(self.log_fp)
+                self.log_fp = open(path, 'w', newline='', buffering=1)  # line-buffered
+                self.log_writer = csv.writer(self.log_fp)
                 self.log_fp.write("# t,ax,ay,az (t in seconds since start)\n")
                 self.log_t0=None; self.logging=True; self.btn_log.setText("■ Stop Logging")
                 self.lbl_status.setText(f"Status: logging → {Path(path).name}")
@@ -465,6 +493,49 @@ class VibGui(QtWidgets.QMainWindow):
                 self.btn_log.setChecked(False)
         else:
             self._stop_log()
+
+    def _on_scroll_changed(self, value: int):
+        # ignore programmatic changes while disabled
+        if not self.scroll_slider.isEnabled():
+            return
+
+        # if user moves away from max, stop following the tail
+        if value < self.scroll_slider.maximum():
+            self.scroll_follow_tail = False
+        else:
+            self.scroll_follow_tail = True
+
+        self._update_time_view_from_slider()
+
+    def _update_time_view_from_slider(self):
+        t, *_ = self.ring.view()
+        if not t.size:
+            return
+
+        t_start = t[0]
+        t_end   = t[-1]
+        if not np.isfinite(t_start) or not np.isfinite(t_end):
+            return
+
+        span = max(0.0, float(t_end - t_start))
+        win  = float(self.history_s)
+        if span <= 0:
+            return
+
+        # If history shorter than window, or we're following tail, or slider disabled:
+        # just show tail like before.
+        if span <= win or self.scroll_follow_tail or not self.scroll_slider.isEnabled():
+            tmax = t_end
+            tmin = max(t_start, tmax - win)
+        else:
+            frac = self.scroll_slider.value() / self.scroll_slider.maximum()
+            frac = min(max(frac, 0.0), 1.0)
+            # left edge slides between earliest and (end - window)
+            tmin = t_start + frac * max(0.0, span - win)
+            tmax = tmin + win
+
+        self.time_plot.setXRange(tmin, tmax, padding=0.0)
+
     
     def _purge_queue(self):
     # dump any leftover packets (live or playback) so mode switches are clean
@@ -496,8 +567,9 @@ class VibGui(QtWidgets.QMainWindow):
         self.t0_dev_us = None        # reset device epoch so playback starts at t=0
         # start with a fresh ring buffer sized for plotting
         fs = (1e6 / self.period_us) if self.period_us else max(1.0, self.sps.hz)
-        cap = max(2048, int(self.history_s * fs * 2))  # ~2x visible history
+        cap = max(2048, int(self.buffer_s * fs))
         self.ring = Ring(cap)
+
         self.mode = "playback"
 
         # start the playback worker
@@ -511,6 +583,12 @@ class VibGui(QtWidgets.QMainWindow):
         self.btn_play.setText("⏸ Pause")
         self.lbl_status.setText(f"Status: playback {filepath.name}")
 
+        # enable scroll bar for playback navigation
+        self.scroll_slider.setEnabled(True)
+        self.scroll_follow_tail = True
+        self.scroll_slider.setValue(self.scroll_slider.maximum())
+
+
     def _stop_playback(self):
         if self.playback:
             try:
@@ -521,19 +599,38 @@ class VibGui(QtWidgets.QMainWindow):
         self.btn_play.setEnabled(False)
         self.btn_play.setChecked(False)
         self.btn_play.setText("▶ Play")
+        self.scroll_follow_tail = True
 
     def _on_toggle_play(self, checked: bool):
-        if not self.playback: self.btn_play.setChecked(False); return
+        if not self.playback:
+            self.btn_play.setChecked(False)
+            return
         self.playback.pause(not checked)
         self.btn_play.setText("⏸ Pause" if checked else "▶ Play")
+
+        if checked:
+            # when (re)starting playback, snap back to the tail
+            self.scroll_follow_tail = True
+            if self.scroll_slider.isEnabled():
+                self.scroll_slider.blockSignals(True)
+                self.scroll_slider.setValue(self.scroll_slider.maximum())
+                self.scroll_slider.blockSignals(False)
+
 
     def _on_speed(self, _):
         sp=self._speed_value()
         if self.playback: self.playback.set_speed(sp)
 
     def _speed_value(self) -> float:
-        try: return float(self.cmb_speed.currentText().replace("×",""))
-        except Exception: return 1.0
+        txt = self.cmb_speed.currentText()
+        if "Max" in txt:
+            # effectively "no timing", ingest as fast as possible
+            return 1e9
+        try:
+            return float(txt.replace("×", ""))
+        except Exception:
+            return 1.0
+
 
     def _back_to_live(self):
         # stop playback first
@@ -543,9 +640,14 @@ class VibGui(QtWidgets.QMainWindow):
         self._purge_queue()          # drop any leftover playback packets
         self.t0_dev_us = None        # next live packet will re-seed time
         fs = (1e6 / self.period_us) if self.period_us else max(1.0, self.sps.hz)
-        cap = max(2048, int(self.history_s * fs * 2))
+        cap = max(2048, int(self.buffer_s * fs))
         self.ring = Ring(cap)
         self.mode = "live"
+
+        # disable scrollbar in live mode (we always follow the tail)
+        self.scroll_slider.setEnabled(False)
+        self.scroll_follow_tail = True
+        self.scroll_slider.setValue(self.scroll_slider.maximum())
 
         self.lbl_status.setText("Status: live (BLE)")
 
@@ -587,18 +689,25 @@ class VibGui(QtWidgets.QMainWindow):
 
             # --- LOGGING: live mode only ---
             if self.mode == "live" and self.logging and self.log_writer is not None:
-                now = time.monotonic()
-                if self.log_t0 is None:
-                    self.log_t0 = now
-                t_rel0 = now - self.log_t0
-                if self.period_us:
-                    for i in range(samples.shape[0]):
-                        self.log_writer.writerow([f"{t_rel0 + i*(self.period_us/1e6):.6f}",
-                                                int(samples[i, 0]), int(samples[i, 1]), int(samples[i, 2])])
-                else:
-                    for i in range(samples.shape[0]):
-                        self.log_writer.writerow([f"{t_rel0:.6f}",
-                                                int(samples[i, 0]), int(samples[i, 1]), int(samples[i, 2])])
+                # ts was just computed above for this block
+                if self.log_t0 is None and ts.size:
+                    # anchor log time to the first sample we log
+                    self.log_t0 = ts[0]
+
+                if self.log_t0 is not None:
+                    for ti, si in zip(ts, samples):
+                        t_rel = ti - self.log_t0
+                        self.log_writer.writerow([
+                            f"{t_rel:.6f}",
+                            int(si[0]), int(si[1]), int(si[2]),
+                        ])
+
+                # make sure data hits disk regularly so logging appears to “start” immediately
+                if self.log_fp:
+                    try:
+                        self.log_fp.flush()
+                    except Exception:
+                        pass
 
             # scale to g and append to ring buffer
             g = samples.astype(np.float64) * self.sens
@@ -608,89 +717,152 @@ class VibGui(QtWidgets.QMainWindow):
         if drained:
             if self.mode == "live":
                 hz = self.sps.tick(drained)
+
+                # adapt GUI fs to measured rate (guard against garbage / zero)
+                if hz > 10.0:
+                    self.fs_gui = hz
+                    self.period_us = 1e6 / self.fs_gui
+
                 self.lbl_status.setText(f"Status: live (BLE)  fs≈{hz:.0f} Hz")
             # playback: keep its own status label
 
-            t, *_ = self.ring.view()
-            if t.size:
-                tmax = t[-1]
-                self.time_plot.setXRange(max(0.0, tmax - self.history_s), tmax, padding=0.0)
+            # if we're following the tail in playback, keep slider at the end
+            if self.scroll_follow_tail and self.scroll_slider.isEnabled():
+                self.scroll_slider.blockSignals(True)
+                self.scroll_slider.setValue(self.scroll_slider.maximum())
+                self.scroll_slider.blockSignals(False)
 
+            # compute and apply X-range based on scroll state
+            self._update_time_view_from_slider()
 
     def _refresh_plots(self):
-        t,x,y,z = self.ring.view()
+        t, x, y, z = self.ring.view()
         if not t.size:
-            for c in (self.cur_fx,self.cur_fy,self.cur_fz,self.cur_fm): c.setData([],[])
+            for c in (self.cur_fx, self.cur_fy, self.cur_fz, self.cur_fm):
+                c.setData([], [])
             return
 
         def _proc(sig):
             arr = sig
-            if self.remove_mean and arr.size: arr = arr - np.mean(arr)
-            if self.use_hpf and arr.size>1:
+            if self.remove_mean and arr.size:
+                arr = arr - np.mean(arr)
+            if self.use_hpf and arr.size > 1:
                 alpha = 0.995
-                y = np.zeros_like(arr)
+                y_hp = np.zeros_like(arr)
                 for i in range(1, arr.size):
-                    y[i] = alpha*(y[i-1] + arr[i] - arr[i-1])
-                arr = y
+                    y_hp[i] = alpha * (y_hp[i - 1] + arr[i] - arr[i - 1])
+                arr = y_hp
             return arr
 
-        # show only the last history_s seconds in the time plots
-        tmax = t[-1]
-        tmin = max(0.0, tmax - self.history_s)
-        i0 = np.searchsorted(t, tmin, side='left')
+        # --- determine visible time window from current plot view / slider ---
+        try:
+            tmin, tmax = self.time_plot.viewRange()[0]  # (xMin, xMax)
+        except Exception:
+            tmin, tmax = float("nan"), float("nan")
 
-        tv = t[i0:]
-        xv = x[i0:]
-        yv = y[i0:]
-        zv = z[i0:]
+        # if viewRange is invalid, fall back to last history_s seconds
+        if (not np.isfinite(tmin)) or (not np.isfinite(tmax)) or (tmax <= tmin):
+            t_end = t[-1]
+            t_start = t[0]
+            tmax = t_end
+            tmin = max(t_start, tmax - self.history_s)
 
-        self.cur_tx.setData(tv, _proc(xv), _callSync='off')
-        self.cur_ty.setData(tv, _proc(yv), _callSync='off')
-        self.cur_tz.setData(tv, _proc(zv), _callSync='off')
+        # indices for current visible time window
+        i0 = np.searchsorted(t, tmin, side="left")
+        i1 = np.searchsorted(t, tmax, side="right")
 
+        tv = t[i0:i1]
+        xv = x[i0:i1]
+        yv = y[i0:i1]
+        zv = z[i0:i1]
 
+        # ----------------- Time-domain plot -----------------
+        if tv.size == 0:
+            # nothing in view; clear time plots
+            self.cur_tx.setData([], [], _callSync='off')
+            self.cur_ty.setData([], [], _callSync='off')
+            self.cur_tz.setData([], [], _callSync='off')
+        else:
+            self.cur_tx.setData(tv, _proc(xv), _callSync='off')
+            self.cur_ty.setData(tv, _proc(yv), _callSync='off')
+            self.cur_tz.setData(tv, _proc(zv), _callSync='off')
+
+        # ----------------- FFT (based on visible window) -----------------
         max_fft = 4096
 
-        # compute sampling rate (fs) first
+        # Choose source for FFT: visible window if non-empty, else whole buffer
+        if tv.size >= 2:
+            src_t, src_x, src_y, src_z = tv, xv, yv, zv
+        else:
+            src_t, src_x, src_y, src_z = t, x, y, z
+
+        # compute sampling rate (fs)
         if self.period_us:
             fs = 1e6 / self.period_us
         else:
-            dt = np.median(np.diff(t[-min(len(t),512):]))
-            fs = 1.0/dt if dt > 0 else max(1.0, self.sps.hz)
+            dt = np.median(np.diff(src_t[-min(len(src_t), 512):]))
+            fs = 1.0 / dt if dt > 0 else max(1.0, self.sps.hz)
 
         # choose FFT size from desired seconds, nearest lower power of two, and clamp
         n_target = int(max(256, fs * self.fft_secs))
         n = 1 << (n_target.bit_length() - 1)
         n = min(n, max_fft)
 
-        if len(x) < n or n < 256:
+        if len(src_x) < n or n < 256:
+            # visible window too short for a decent FFT
             for c in (self.cur_fx, self.cur_fy, self.cur_fz, self.cur_fm):
                 c.setData([], [])
             return
 
-        tx, ty, tz = x[-n:], y[-n:], z[-n:]
+        tx_sig = src_x[-n:]
+        ty_sig = src_y[-n:]
+        tz_sig = src_z[-n:]
 
         win = np.hanning(n)
+
         def fft_norm(sig):
             sigv = sig.copy()
-            if self.remove_mean: sigv -= np.mean(sigv)
-            if self.use_hpf and sigv.size>1:
+            if self.remove_mean:
+                sigv -= np.mean(sigv)
+            if self.use_hpf and sigv.size > 1:
                 alpha = 0.995
-                y = np.zeros_like(sigv)
-                for i in range(1, sigv.size): y[i]=alpha*(y[i-1]+sigv[i]-sigv[i-1])
-                sigv = y
+                y_hp = np.zeros_like(sigv)
+                for i in range(1, sigv.size):
+                    y_hp[i] = alpha * (y_hp[i - 1] + sigv[i] - sigv[i - 1])
+                sigv = y_hp
             spec = np.fft.rfft(sigv * win)
-            mag = np.abs(spec); m = np.max(mag)
-            return (mag / m) if m>0 else mag
+            mag = np.abs(spec)
+            m = np.max(mag)
+            return (mag / m) if m > 0 else mag
 
-        fx = fft_norm(tx); fy = fft_norm(ty); fz = fft_norm(tz)
-        fmag = np.sqrt(fx**2 + fy**2 + fz**2); fm = np.max(fmag); fmag = (fmag/fm) if fm>0 else fmag
-        freqs = np.fft.rfftfreq(n, d=1.0/fs)
+        fx = fft_norm(tx_sig)
+        fy = fft_norm(ty_sig)
+        fz = fft_norm(tz_sig)
+        fmag = np.sqrt(fx**2 + fy**2 + fz**2)
+        fm = np.max(fmag)
+        fmag = (fmag / fm) if fm > 0 else fmag
 
-        self.cur_fx.setData(freqs, fx, _callSync='off')
-        self.cur_fy.setData(freqs, fy, _callSync='off')
-        self.cur_fz.setData(freqs, fz, _callSync='off')
-        self.cur_fm.setData(freqs, fmag, _callSync='off')
+        freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
+        # --- display only a "safe" band up to 200 Hz (or Nyquist, whichever is lower) ---
+        max_display = min(200.0, fs / 2.0)
+        mask = freqs <= max_display
+
+        freqs_disp = freqs[mask]
+        fx_disp    = fx[mask]
+        fy_disp    = fy[mask]
+        fz_disp    = fz[mask]
+        fmag_disp  = fmag[mask]
+
+        self.cur_fx.setData(freqs_disp, fx_disp, _callSync='off')
+        self.cur_fy.setData(freqs_disp, fy_disp, _callSync='off')
+        self.cur_fz.setData(freqs_disp, fz_disp, _callSync='off')
+        self.cur_fm.setData(freqs_disp, fmag_disp, _callSync='off')
+
+        # lock X-axis so it doesn't jump around with small fs changes
+        for pw in (self.fft_x, self.fft_y, self.fft_z, self.fft_m):
+            pw.setXRange(0, max_display, padding=0)
+
 
 # -------------------- Main -----------------------------
 def main():
